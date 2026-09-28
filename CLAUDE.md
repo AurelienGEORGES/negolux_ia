@@ -1,65 +1,148 @@
-# CLAUDE.md
+# Guide de contribution — Negolux MCP
 
-Ce fichier donne des indications à Claude Code (claude.ai/code) pour travailler sur le code de ce dépôt.
+## Objet
 
-## Présentation
+Negolux MCP est un serveur [Model Context Protocol](https://modelcontextprotocol.io) qui donne aux LLM et aux agents IA un accès **en lecture seule** à la base MariaDB de l'ERP Negolux (Concept-Usine).
 
-Negolux MCP : serveur MCP (Model Context Protocol) donnant un accès **en lecture seule** à la base MySQL de production de l'ERP Negolux (Concept-Usine). Il est utilisé par des LLM (Claude…) et par les agents IA de n8n (nœud « MCP Client Tool »). Installation, tests locaux avec Laragon et configuration des clients : voir `README.md`.
+Le projet utilise Node.js 20 ou supérieur, CommonJS, `@modelcontextprotocol/sdk`, `mysql2` et Zod v4. Le code, les messages affichés aux clients et les journaux sont en français.
 
-Node.js ≥ 20 en CommonJS (la prod tourne en v20.17). Code, commentaires, descriptions d'outils et logs sont en français.
+Le serveur doit toujours protéger les données de production. Les droits MariaDB du compte utilisé restent la barrière principale : ils doivent être limités à `SELECT`, idéalement table par table ou via des vues dédiées.
 
 ## Commandes
 
-- `npm install`
-- `npm run dev` : lance le serveur avec `node --watch`
-- `npm start`
-- `npm run tester [-- "SELECT …"]` : test de bout en bout du serveur lancé (santé, outils, tables, requête optionnelle), avec le même `.env`
-- `npm run inspector` : MCP Inspector (choisir le transport Streamable HTTP, sinon erreur STDIO `mcp-server-everything ENOENT`)
+Depuis `C:\laragon\www\negolux_mcp` :
 
-Pas de build, de linter ni de tests automatisés. La config est lue depuis `.env` (modèle commenté : `.env.example`) ; le serveur s'arrête au démarrage si une variable obligatoire manque.
+```powershell
+npm install
+npm run dev
+npm start
+npm test
+node tests/tester.js
+npm run inspector
+```
+
+- `npm run dev` démarre le serveur avec rechargement automatique.
+- `npm start` démarre le serveur sans surveillance des fichiers.
+- `npm test` lance les tests Jest sans base de données.
+- `node tests/tester.js` est le test de fumée MCP : le serveur doit déjà être démarré et le fichier `.env` doit être configuré. Une requête facultative peut être passée en argument.
+- `npm run inspector` démarre MCP Inspector. Choisir **Streamable HTTP**, jamais STDIO.
+
+`package.json` contient actuellement un script `npm run tester` pointant vers `scripts/tester.js`, qui n'existe pas. Utiliser `node tests/tester.js` tant que ce script n'est pas corrigé.
 
 ## Architecture
 
-- `server.js` : point d'entrée HTTP. `createMcpExpressApp` (SDK) parse le JSON et valide l'en-tête Host : seul `localhost` est accepté, sauf si `ALLOWED_HOSTS` est défini (obligatoire derrière un domaine).
-  - `POST /mcp` : Streamable HTTP **sans état**, un `McpServer` et un transport neufs par requête (GET/DELETE → 405).
-  - `GET /sse` + `POST /messages` : ancien transport SSE ; sessions en mémoire, donc un seul processus.
-  - `GET /health` : ping de la base, sans authentification. Toutes les autres routes passent par `exigerJeton` (`src/auth.js`).
-- `src/mcp.js` : `creerServeurMcp()` crée le serveur, fixe les `instructions` envoyées au client et enregistre les modules de `src/tools/`. Ne jamais partager une instance entre connexions (le SDK lève « Already connected to a transport »).
-- `src/db.js` : pool `mysql2`. `executerLecture(sql, valeurs, { maxLignes })` est **le seul point d'accès à la base** : transaction `READ ONLY` puis `ROLLBACK`, limite de durée côté serveur (`max_execution_time` MySQL, repli `max_statement_time` MariaDB), lecture en flux coupée au-delà de `maxLignes` (la connexion est alors détruite au lieu d'être rendue au pool).
-- `src/sql.js` : `verifierRequeteLecture()` filtre le SQL libre venant du LLM. C'est un garde-fou ; la vraie barrière est le compte MySQL limité à `SELECT` plus la transaction `READ ONLY`.
-- `src/tools/reponse.js` : `outil(nom, handler)` (durée, logs, exceptions converties en résultat `isError`), `json()` (résume les Buffers, tronque les textes longs), annotations `LECTURE_SEULE`.
+### Entrée HTTP
 
-## Ajouter un outil
+`server.js` crée l'application Express MCP.
 
-- Écrire un module dans `src/tools/` qui exporte `function (serveur)` et l'ajouter à `MODULES_OUTILS` dans `src/mcp.js`.
-- `serveur.registerTool(nom, { title, description, inputSchema: { ...forme zod v4 }, annotations: LECTURE_SEULE }, outil(nom, async (args) => ...))`.
-- Toujours passer par `executerLecture()` avec des `?` pour les valeurs, jamais de concaténation.
-- La description est lue par le LLM : dire quand utiliser l'outil et ce qu'il renvoie.
-- Une fois le schéma de l'ERP connu, préférer des outils métier (SAV, stock, clients…) au SQL libre.
+- `POST /mcp` est l'unique endpoint MCP. Il utilise Streamable HTTP, avec authentification Bearer.
+- Une nouvelle instance de `McpServer` et un nouveau transport sont créés pour chaque requête : ne jamais partager une instance entre connexions, sinon le SDK renvoie `Already connected to a transport`.
+- `GET /health` effectue un ping de base de données sans authentification.
+- `GET /` expose les métadonnées et les outils chargés.
+- Le transport SSE (`/sse`, `/messages`) n'est pas implémenté.
+- `createMcpExpressApp` contrôle l'en-tête `Host` avec `ALLOWED_HOSTS`. Cette variable doit être renseignée derrière un domaine ou un reverse proxy.
 
-## Données de l'ERP (base `negolux`)
+### Configuration et authentification
 
-- Code source de l'ERP (PHP) : `C:\laragon\www\negolux`. Requêtes des écrans dans `z/zamback/classe/model/` (ex. `commandestatv2.php`), crons dans `z/zamback/module/import_export/`. Pour créer un outil métier, partir de la requête et des filtres de l'écran correspondant.
-- Types de produits (`produit.TYPE_COMPOSE`) : `ARTSIM` article simple, `PRODCOMPUNI` / `PRODCOMPGEN` produits composés vendus, `ARTCOMPUNI` / `ARTCOMPGEN` articles composants. Composition dans `produit_compose` (`ID_PRODUIT_PARENT`, `ID_PRODUIT`, `QTY_PRODUIT`). Le prix est porté par le produit vendu, le stock par les articles.
-- Filtre « vente » de l'ERP : `commande_produit cp` joint à `commande c` avec `cp.SUP != 1`, `c.SUP != 1`, `c.ID_ETAT != 10`, `c.IS_FULFILLMENT = 0`, `c.TOTAL_TTC != 1`, sur `c.DATE_COMMANDE`. CA d'une ligne = `QTY * PRIX_UNIT + TOTAL_TRANSPORT`.
-- `produit_stat` : une ligne par produit et par jour (la veille), calculée par le cron `DIVERS/calcul_stock_vente_produit.php`, uniquement pour les produits `LOGIST = 'DENJEAN'`. Table très volumineuse en prod avec seulement des index simples (`ID_PRODUIT`, `SKU`, `DATE`) : toujours imposer une plage de dates et agréger en SQL.
-  - **Ne jamais additionner `CA_VENTE` / `MARGE_VENTE` sur toutes les lignes** : la ligne d'un composant reprend le CA complet de la ligne du produit composé parent (non proratisé), d'où un double comptage (31 M€ au lieu d'environ 12 M€ sur 2026). CA et marge : lignes des produits vendus (`ARTSIM`, `PRODCOMPUNI`, `PRODCOMPGEN`) uniquement, vérifié à ±3 % contre les commandes.
-  - `NB_VENTE` : sur les articles (`ARTSIM`, `ARTCOMP*`), pièces physiques y compris via les produits composés ; sur les produits vendus, unités vendues. Ne pas mélanger les deux.
-  - `STOCK*`, `PRIX_*`, `TAUX_AVARIE` / `TAUX_CANCEL` (30 jours glissants) sont des photos : prendre la valeur à la dernière date, ne jamais additionner.
-  - `MARGE_VENTE` = CA − commission marketplace − `QTY * PRIX_CRMV_TTC` (coût d'achat).
+- `src/config.js` charge `.env`, valide les variables obligatoires et les limites numériques.
+- `src/auth.js` vérifie `Authorization: Bearer <MCP_API_KEY>` avec une comparaison à temps constant.
+- Les variables obligatoires sont `MCP_API_KEY`, `DB_HOST`, `DB_USER` et `DB_NAME`.
+- Ne jamais versionner `.env`. Le modèle versionné est `.env.example`.
 
-## Pièges
+### Accès MariaDB
 
-- Options `dateStrings` et `bigNumberStrings` : les dates, les `BIGINT` (y compris les littéraux et expressions entières, ex. `SELECT 1`) et les `DECIMAL` arrivent en chaînes.
-- `/mcp` étant sans état, aucune donnée n'est conservée entre deux appels et le serveur ne peut pas envoyer de notifications au client.
-- `.env.example` est versionné grâce à une exception dans `.gitignore`.
-- Déploiement sur un serveur Linux dans `/home/negoluxmcp/public_html`. `pm2` est dans les dépendances.
+`src/db.js` est l'unique point d'accès à la base.
 
-## Documentation de la base
+- Toujours appeler `executerLecture(sql, valeurs, options)` ; ne jamais créer de connexion ni appeler le pool depuis un outil.
+- Les valeurs SQL passent par les paramètres `?`, jamais par concaténation.
+- Les requêtes sont exécutées dans une transaction `READ ONLY`, puis annulées.
+- Les résultats sont lus en flux et coupés à `SQL_MAX_ROWS`. Une connexion dont le flux est coupé est détruite, car elle peut encore contenir des paquets non lus.
+- Une durée maximale est configurée côté client et, lorsque disponible, côté serveur MariaDB/MySQL.
+- `dateStrings` et `bigNumberStrings` font revenir dates, `BIGINT` et `DECIMAL` sous forme de chaînes. Ne pas les convertir implicitement si la précision est importante.
 
-- Structure des tables : docs/schema.md
-- Règles métier : docs/business-rules.md
-- Vocabulaire : docs/glossary.md
-- Requêtes courantes : docs/common-queries.md
-- Qualité des données : docs/data-quality.md
-- KPIs : docs/kpis.md
+### Serveur MCP et outils
+
+`src/mcp.js` crée une nouvelle instance MCP et porte les instructions envoyées aux clients. Elles doivent rester courtes et orienter vers les outils et la documentation.
+
+`src/tools/index.js` enregistre les outils disponibles :
+
+| Module | Outils |
+|---|---|
+| `schema.js` | `lister_tables`, `decrire_table` |
+| `requete.js` | `executer_requete_sql` |
+| `commandes.js` | `compter_commandes` |
+| `produits.js` | `rechercher_produit`, `composition_produit` |
+| `doc.js` | `consulter_doc` |
+
+Le module facultatif `src/tools/stats.js` peut enregistrer `stats_commandes` et `historique_produits`. Il est absent de ce dépôt : ces outils ne sont donc pas exposés. Ne pas les citer comme disponibles dans une interface ou une documentation sans vérifier `statsDisponibles`.
+
+Tous les outils doivent :
+
+1. définir un `inputSchema` Zod précis ;
+2. définir les annotations `LECTURE_SEULE` ;
+3. passer par `outil(nom, handler)` de `src/tools/reponse.js` ;
+4. retourner `json(...)` ou `erreur(...)` ;
+5. fournir une description destinée à un LLM : quand employer l'outil, ce qu'il renvoie et ses limites métier ;
+6. expliciter la période, le périmètre et les avertissements dans leur réponse lorsqu'ils manipulent des données métier.
+
+### SQL libre et données sensibles
+
+`executer_requete_sql` est un dernier recours. Les outils métier doivent être privilégiés chaque fois que le besoin est couvert.
+
+- `src/tools/securite.js` est le validateur effectivement utilisé : il interdit les écritures, les requêtes multiples, `SELECT *`, les verrous, exports, fonctions coûteuses et objets connus pour contenir des secrets.
+- Il supprime les commentaires avant analyse, masque les IBAN détectés dans les résultats et filtre les colonnes sensibles.
+- `src/sql.js` est un ancien validateur non utilisé par l'outil SQL. Ne pas l'étendre indépendamment de `src/tools/securite.js` ; fusionner ou supprimer ce code avant toute évolution de la politique SQL.
+- Les filtres applicatifs sont volontairement défensifs, mais ne remplacent jamais les droits MariaDB.
+
+## Documentation métier
+
+Les documents de référence sont dans `docs/` :
+
+| Fichier | Sujet MCP | Contenu |
+|---|---|---|
+| `kpis.md` | `kpis` | CA, marge, taux, pièces et conventions de calcul. |
+| `business-rules.md` | `regles_metier` | Périmètres de commande et pièges produits. |
+| `glossary.md` | `glossaire` | Vocabulaire ERP, logistique, SAV et marketplaces. |
+| `common-queries.md` | `requetes_types` | Requêtes MariaDB validées. |
+| `data-quality.md` | `qualite_donnees` | Anomalies et limites connues. |
+| `schema.md` | `schema` | Tables, jointures et colonnes interdites. |
+
+Avant d'ajouter un outil métier, consulter les règles et requêtes documentées, puis vérifier le comportement dans le code de l'ERP si nécessaire :
+
+- écrans et modèles : `C:\laragon\www\negolux\z\zamback\classe\model\` ;
+- tâches planifiées : `C:\laragon\www\negolux\z\zamback\module\import_export\`.
+
+Les documents contiennent des points marqués **À CONFIRMER**. Ne pas transformer ces hypothèses en règles codées sans validation métier.
+
+`consulter_doc` lit un fichier entier, mais le sérialiseur de réponse tronque les textes longs. Pour ajouter de la documentation consommable par les LLM, préférer des sections courtes et structurées ; une évolution souhaitable est d'ajouter recherche ou pagination à cet outil.
+
+## Conventions métier importantes
+
+- Tous les montants métier sont en euros **TTC**.
+- La date de référence des commandes est `DATE_COMMANDE`, sauf question explicite sur les expéditions.
+- Le périmètre de statistiques usuel exclut les commandes supprimées, le fulfillment et les annulées non expédiées ; les SAV sont inclus par défaut.
+- `commande.ETAT` est inutilisée. Utiliser `commande.ID_ETAT`.
+- Les dates vides sont représentées par `0000-00-00 00:00:00`, pas par `NULL`.
+- La table `texte` est versionnée : utiliser `ID_LANG = 1 AND ACTUEL = 1` pour les désignations françaises.
+- Éviter le SQL direct sur `produit_stat`, très volumineuse. Le module statistique prévu doit en borner les périodes et agréger en base.
+- Ne jamais additionner indistinctement le CA ou la marge de `produit_stat` : les composants peuvent reproduire le CA du produit composé.
+- Ne jamais sélectionner des mots de passe, identifiants marketplace, tokens ou coordonnées bancaires. Éviter aussi les données personnelles client sauf demande explicitement justifiée sur une commande précise.
+
+## Ajouter ou modifier un outil
+
+1. Chercher d'abord si un outil existant ou une requête type répond déjà au besoin.
+2. Créer ou modifier un module dans `src/tools/`, puis l'enregistrer dans `src/tools/index.js`.
+3. Employer Zod pour borner les entrées, notamment dates, limites, énumérations et regroupements.
+4. Utiliser des listes fermées pour les identifiants SQL non paramétrables, comme les axes de regroupement.
+5. Ajouter des tests unitaires sans dépendance réseau ni MariaDB, sur le modèle de `tests/outils.test.js` et `tests/securite.test.js`.
+6. Mettre à jour `README.md`, les instructions MCP et les documents de `docs/` lorsque le comportement, la disponibilité ou le périmètre évolue.
+7. Lancer `npm test`.
+
+## Déploiement
+
+- Déployer derrière un reverse proxy HTTPS.
+- Définir `ALLOWED_HOSTS` pour chaque hôte public attendu.
+- Activer `DB_SSL=true` pour une base distante lorsque TLS est disponible.
+- Utiliser un compte MariaDB dédié et à privilèges minimaux.
+- Ne pas exposer directement la base de données ni les fichiers `.env`.
+- Surveiller `/health`, les erreurs d'outils et la saturation du pool MariaDB.
