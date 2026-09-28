@@ -1,0 +1,32 @@
+{
+  "name": "negolux-mcp",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Serveur MCP d'accès en lecture seule à la base de données de l'ERP Negolux",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "tester": "node scripts/tester.js",
+    "inspector": "npx -y @modelcontextprotocol/inspector@latest",
+    "test": "jest"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "dotenv": "^16.4.5",
+    "mysql2": "^3.9.7",
+    "pm2": "^7.0.4",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "jest": "^30.5.2"
+  },
+  "jest": {
+    "roots": [
+      "<rootDir>/tests"
+    ]
+  }
+}
